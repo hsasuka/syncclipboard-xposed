@@ -100,7 +100,7 @@ fun ServerConfigScreen(
     fun saveConfig(config: AppConfig) {
         Prefs.saveConfig(context, config)
         appConfig = config
-        // Push config to system_server so SyncEngine can use it
+        // Push config to the SystemUI-hosted SyncEngine so it picks the change up
         scope.launch {
             try {
                 val configJson = Json.encodeToString(AppConfig.serializer(), config)

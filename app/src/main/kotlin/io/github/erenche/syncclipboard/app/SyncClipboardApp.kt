@@ -31,8 +31,8 @@ class SyncClipboardApp : Application() {
         Logger.maxBufferSize = config.logBufferSize
         Logger.info(TAG, "SyncClipboardApp created")
 
-        // SyncEngine 在 system_server 中运行（由 GeneralHooker 初始化）
-        // App 进程不初始化 SyncEngine，通过 bridge 向 system_server 查询
+        // SyncEngine 在 com.android.systemui 进程中运行（由 GeneralHooker 初始化）
+        // App 进程不初始化 SyncEngine，通过 bridge 向 SystemUI 引擎查询
 
         XposedServiceHelper.registerListener(object : XposedServiceHelper.OnServiceListener {
             override fun onServiceBind(service: XposedService) {

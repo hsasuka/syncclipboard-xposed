@@ -36,6 +36,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -53,13 +54,20 @@ import kotlinx.serialization.json.Json
 /**
  * SyncEngine — 同步引擎核心。
  *
- * 在 system_server 进程中运行，由 GeneralHooker 初始化。
- * 负责监听剪贴板变化（来自 ClipboardServiceHooker）、上传/下载、历史记录、IPC 路由。
+ * 运行在 com.android.systemui 进程（注入范围见 META-INF/xposed/scope.list），
+ * 由 GeneralHooker 在 SystemUI 的 Application#onCreate 之后初始化。
+ * 选 SystemUI 是因为它豁免 Android 10+ 的后台剪贴板访问限制。
+ * 负责监听剪贴板变化、上传/下载、历史记录、IPC 路由。
+ *
+ * 进程分工：
+ * - system_server 只承载 SystemNotificationHooker 的通知正文截获，不运行引擎
+ * - app 进程只运行 UI，不直接访问数据库，一切经 SyncClipboardBridge 查询引擎
  *
  * 去重策略：
+ * - 剪贴板事件唯一来源是 ClipboardManager 的 OnPrimaryClipChangedListener
+ *   （registerClipListener），本模块不 hook ClipboardService
  * - onLocalClipboardChanged 的哈希 check-and-set 由 localDedupLock 保护，防止竞态
- * - system_server 中不注册 OnPrimaryClipChangedListener / 不轮询本地剪贴板
- *   仅依赖 ClipboardServiceHooker 提供的事件
+ * - 写入本地剪贴板之前先更新 lastLocalHash，避免自己的写入被回声成一次上传
  */
 class SyncEngine private constructor() {
 
@@ -1411,41 +1419,43 @@ class SyncEngine private constructor() {
         // 拉取 profile 并判断内容是否变化（唯一需要持有 isFetching 的临界区）。
         // 网络请求完成后立即释放 isFetching：广播/下载/历史均为异步执行，
         // 不占用 fetch 锁，避免下载卡住时阻塞轮询与后续手动刷新。
-        val client = apiClient
-        if (client == null) {
-            isFetching = false
-            Logger.warn(TAG, "fetchRemoteClipboard: apiClient is null")
-            return false
-        }
+        // 释放写在 finally：临界区内任何抛出路径都会漏掉手动清零，
+        // 而漏清会让之后每次拉取都在入口短路返回，下载静默停止直到 SystemUI 重启。
+        val (profile, hash) = try {
+            val client = apiClient
+            if (client == null) {
+                Logger.warn(TAG, "fetchRemoteClipboard: apiClient is null")
+                return false
+            }
 
-        val profile = try {
-            client.getClipboard()
+            val fetched = client.getClipboard()
+            if (fetched == null) {
+                setConnected(false)
+                Logger.warn(TAG, "fetchRemoteClipboard: getClipboard returned null")
+                return false
+            }
+            Logger.info(TAG, "fetchRemoteClipboard: type=${fetched.type}, hash=${fetched.hash}, text=${fetched.text.take(50)}, hasData=${fetched.hasData}")
+            val fetchedHash = fetched.hash
+            if (fetchedHash == null) {
+                setConnected(false)
+                Logger.warn(TAG, "fetchRemoteClipboard: profile.hash is null, skipping")
+                return false
+            }
+
+            setConnected(true)
+            lastSyncTime = System.currentTimeMillis()
+            fetched to fetchedHash
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            isFetching = false
             setConnected(false)
             Logger.warn(TAG, "Remote fetch error", e)
             return false
-        }
-        if (profile == null) {
+        } finally {
             isFetching = false
-            setConnected(false)
-            Logger.warn(TAG, "fetchRemoteClipboard: getClipboard returned null")
-            return false
-        }
-        Logger.info(TAG, "fetchRemoteClipboard: type=${profile.type}, hash=${profile.hash}, text=${profile.text.take(50)}, hasData=${profile.hasData}")
-        val hash = profile.hash
-        if (hash == null) {
-            isFetching = false
-            setConnected(false)
-            Logger.warn(TAG, "fetchRemoteClipboard: profile.hash is null, skipping")
-            return false
         }
 
-        setConnected(true)
-        lastSyncTime = System.currentTimeMillis()
-
-        // 网络部分完成，释放 isFetching，补跑排队的手动刷新
-        isFetching = false
+        // 网络部分完成，补跑排队的手动刷新
         if (pendingForceFetch) {
             pendingForceFetch = false
             if (apiClient != null) {
@@ -1993,7 +2003,11 @@ class SyncEngine private constructor() {
                     // 防御：配置变更竞态期间收到推送时，总开关已关则丢弃
                     if (!config.enableAutoSync) return@launch
                     Logger.info(TAG, "SignalR push: RemoteProfileChanged, triggering fetch")
-                    fetchRemoteClipboard(force = true)
+                    try {
+                        fetchRemoteClipboard(force = true)
+                    } catch (e: Exception) {
+                        Logger.warn(TAG, "SignalR push fetch failed", e)
+                    }
                 }
             }
             client.onHistoryChanged = { dto ->
