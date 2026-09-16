@@ -43,6 +43,11 @@
             </intent-filter>
         </activity>
 
+        <!-- 服务器编辑页独立承载，使用系统默认的预测性返回动画 -->
+        <activity
+            android:name=".activity.ServerConfigActivity"
+            android:label="@string/activity_server_config" />
+
         <activity
             android:name=".activity.SettingsActivity"
             android:label="@string/activity_settings" />

@@ -1,13 +1,12 @@
 package io.github.erenche.syncclipboard.app.activity
 
 import android.app.Activity
+import android.content.Intent
+import android.os.Bundle
 import android.widget.Toast
-import androidx.activity.compose.PredictiveBackHandler
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.tween
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -18,9 +17,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -29,11 +26,9 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.CancellationException
 
 import io.github.erenche.syncclipboard.app.R
 import io.github.erenche.syncclipboard.app.compose.AppToolBarListContainer
-import io.github.erenche.syncclipboard.app.util.UiState
 import io.github.erenche.syncclipboard.bridge.BridgeKeys
 import io.github.erenche.syncclipboard.bridge.SyncClipboardBridge
 import io.github.erenche.syncclipboard.common.Prefs
@@ -58,14 +53,120 @@ import top.yukonga.miuix.kmp.overlay.OverlayDialog
 import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
-/** 编辑目标：null = 服务器列表，-1 = 新建，>=0 = 编辑对应下标 */
-private data class EditTarget(val index: Int)
+/**
+ * 独立承载服务器编辑页，使系统能够接管 Activity 级预测性返回动画。
+ * 编辑页不再在 MainActivity 内部模拟固定方向的平移动画。
+ */
+class ServerConfigActivity : BaseActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            ServerEditHost(
+                serverIndex = intent.getIntExtra(EXTRA_SERVER_INDEX, -1),
+                onFinished = { changed ->
+                    if (changed) setResult(Activity.RESULT_OK)
+                    finish()
+                }
+            )
+        }
+    }
+
+    companion object {
+        const val EXTRA_SERVER_INDEX = "server_index"
+    }
+}
 
 /**
- * 服务器管理界面 — 列表（常驻背景层）与编辑页（前景层）。
+ * 编辑页状态与配置保存逻辑。配置保存后通过结果通知列表页刷新，
+ * 同时继续把配置推送给 SystemUI 中的同步引擎。
+ */
+@Composable
+private fun ServerEditHost(
+    serverIndex: Int,
+    onFinished: (changed: Boolean) -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var appConfig by remember { mutableStateOf(Prefs.loadConfig(context)) }
+    var showDeleteConfirm by remember { mutableStateOf(false) }
+
+    val effectiveIndex = serverIndex.takeIf { it in appConfig.servers.indices } ?: -1
+    val editingServer = effectiveIndex.takeIf { it >= 0 }?.let { appConfig.servers[it] }
+
+    fun saveAndFinish(config: AppConfig) {
+        Prefs.saveConfig(context, config)
+        appConfig = config
+        scope.launch {
+            try {
+                val configJson = Json.encodeToString(AppConfig.serializer(), config)
+                val payload = Bundle().apply { putString("config", configJson) }
+                SyncClipboardBridge.with(context)
+                    .to("com.android.systemui")
+                    .key(BridgeKeys.PUSH_CONFIG)
+                    .payload(payload)
+                    .send()
+            } catch (_: Exception) {
+                // 配置已经持久化；SystemUI 下次启动或配置刷新时会重新读取。
+            } finally {
+                onFinished(true)
+            }
+        }
+    }
+
+    ServerEditPage(
+        server = editingServer,
+        serverIndex = effectiveIndex,
+        isActive = effectiveIndex >= 0 && effectiveIndex == appConfig.activeServerIndex,
+        bottomPadding = 0.dp,
+        showDeleteConfirm = showDeleteConfirm,
+        onRequestDelete = { showDeleteConfirm = true },
+        onDismissDelete = { showDeleteConfirm = false },
+        onConfirmDelete = {
+            if (effectiveIndex >= 0) {
+                val servers = appConfig.servers.toMutableList()
+                servers.removeAt(effectiveIndex)
+                var newConfig = appConfig.copy(servers = servers)
+                if (effectiveIndex == appConfig.activeServerIndex) {
+                    newConfig = newConfig.copy(activeServerIndex = if (servers.isEmpty()) -1 else 0)
+                } else if (effectiveIndex < appConfig.activeServerIndex) {
+                    newConfig = newConfig.copy(activeServerIndex = appConfig.activeServerIndex - 1)
+                }
+                showDeleteConfirm = false
+                saveAndFinish(newConfig)
+            }
+        },
+        onSetActive = if (effectiveIndex >= 0 && effectiveIndex != appConfig.activeServerIndex) {
+            {
+                saveAndFinish(appConfig.copy(activeServerIndex = effectiveIndex))
+            }
+        } else null,
+        onBack = { onFinished(false) },
+        onSave = { newServer ->
+            val servers = appConfig.servers.toMutableList()
+            if (effectiveIndex >= 0) {
+                servers[effectiveIndex] = newServer
+            } else {
+                servers.add(newServer)
+            }
+            var newConfig = appConfig.copy(servers = servers)
+            if (appConfig.activeServerIndex < 0) {
+                newConfig = newConfig.copy(activeServerIndex = 0)
+            }
+            Toast.makeText(
+                context,
+                if (effectiveIndex >= 0) R.string.server_updated else R.string.server_added,
+                Toast.LENGTH_SHORT
+            ).show()
+            saveAndFinish(newConfig)
+        }
+    )
+}
+
+/**
+ * 服务器管理界面 — 服务器列表页。
  *
- * 编辑页支持**预测性返回**：从左边缘返回手势时编辑页跟随手指向右平移，
- * 松手提交则滑出返回列表、取消则回弹；顶部返回键/保存/删除走同一条滑出动画。
+ * 服务器编辑页由 [ServerConfigActivity] 独立承载，返回时使用系统默认的
+ * Activity 预测性返回动画，从而和其他独立页面保持一致。
  */
 @Composable
 fun ServerConfigScreen(
@@ -74,18 +175,24 @@ fun ServerConfigScreen(
 ) {
     val context = LocalContext.current
     val activity = context as? Activity
-    val scope = rememberCoroutineScope()
 
     var appConfig by remember { mutableStateOf(Prefs.loadConfig(context)) }
-    // null = 列表；EditTarget(-1) = 新建；EditTarget(i) = 编辑第 i 个
-    var editTarget by remember { mutableStateOf<EditTarget?>(null) }
-    var showDeleteConfirm by remember { mutableStateOf(false) }
-    val showEdit = editTarget != null
 
-    // 编辑状态同步给主界面（隐藏底栏、禁用 pager 滑动）；离开组合时务必重置
-    LaunchedEffect(editTarget) { UiState.serverEditing = editTarget != null }
-    DisposableEffect(Unit) {
-        onDispose { UiState.serverEditing = false }
+    val editLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            // 编辑页已将配置写入共享首选项，返回列表后刷新显示。
+            appConfig = Prefs.loadConfig(context)
+        }
+    }
+
+    fun openEditor(index: Int) {
+        editLauncher.launch(
+            Intent(context, ServerConfigActivity::class.java).apply {
+                putExtra(ServerConfigActivity.EXTRA_SERVER_INDEX, index)
+            }
+        )
     }
 
     // Push current config to both app and systemui process on screen load
@@ -97,135 +204,14 @@ fun ServerConfigScreen(
         } catch (_: Exception) {}
     }
 
-    fun saveConfig(config: AppConfig) {
-        Prefs.saveConfig(context, config)
-        appConfig = config
-        // Push config to the SystemUI-hosted SyncEngine so it picks the change up
-        scope.launch {
-            try {
-                val configJson = Json.encodeToString(AppConfig.serializer(), config)
-                val payload = android.os.Bundle().apply { putString("config", configJson) }
-                SyncClipboardBridge.with(context).to("com.android.systemui").key(BridgeKeys.PUSH_CONFIG).payload(payload).send()
-            } catch (_: Exception) {}
-        }
-    }
-
-    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-        val editPageWidth = with(LocalDensity.current) { maxWidth.toPx() }
-
-        // ─── 背景层：服务器列表（常驻，编辑页滑出时从下方露出）──────────
-        ServerListPane(
-            appConfig = appConfig,
-            bottomPadding = bottomPadding,
-            canBack = canBack,
-            onBack = { activity?.finish() },
-            onAddServer = { editTarget = EditTarget(-1) },
-            onEditServer = { index -> editTarget = EditTarget(index) },
-        )
-
-        // ─── 前景层：服务器编辑页 ───────────────────────────────────
-        if (showEdit) {
-            // Animatable 在编辑页首次组合时即初始化为"屏外"，避免入场第一帧闪现在就位状态
-            val editOffsetX = remember { Animatable(editPageWidth) }
-            // 入场：从屏幕右侧滑入盖住列表
-            LaunchedEffect(Unit) {
-                editOffsetX.animateTo(0f, tween(320, easing = FastOutSlowInEasing))
-            }
-
-            /** 关闭编辑页：滑出到屏幕外后再移除（保存/删除/顶部返回键共用） */
-            fun closeEdit() {
-                scope.launch {
-                    editOffsetX.animateTo(editPageWidth, tween(280, easing = FastOutSlowInEasing))
-                    editTarget = null
-                }
-            }
-
-            // 预测性返回：跟随手指平移，提交=滑出返回列表，取消=回弹
-            PredictiveBackHandler(enabled = true) { progress ->
-                try {
-                    progress.collect { event ->
-                        scope.launch { editOffsetX.snapTo(editPageWidth * event.progress) }
-                    }
-                    // 手势完成（或硬件返回键：无进度事件）→ 补完滑出并返回列表
-                    scope.launch {
-                        editOffsetX.animateTo(editPageWidth, tween(200))
-                        editTarget = null
-                    }
-                } catch (e: CancellationException) {
-                    // 手势取消 → 回弹复位
-                    scope.launch {
-                        editOffsetX.animateTo(0f, spring(dampingRatio = Spring.DampingRatioNoBouncy))
-                    }
-                    throw e
-                }
-            }
-
-            val editingServer = editTarget?.index?.takeIf { it >= 0 }?.let { appConfig.servers.getOrNull(it) }
-
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .graphicsLayer { translationX = editOffsetX.value }
-            ) {
-                ServerEditPage(
-                    server = editingServer,
-                    serverIndex = editTarget?.index ?: -1,
-                    isActive = (editTarget?.index ?: -1) >= 0 &&
-                        editTarget?.index == appConfig.activeServerIndex,
-                    bottomPadding = bottomPadding,
-                    showDeleteConfirm = showDeleteConfirm,
-                    onRequestDelete = { showDeleteConfirm = true },
-                    onDismissDelete = { showDeleteConfirm = false },
-                    onConfirmDelete = {
-                        val index = editTarget?.index
-                        if (index != null) {
-                            val servers = appConfig.servers.toMutableList()
-                            servers.removeAt(index)
-                            var newConfig = appConfig.copy(servers = servers)
-                            if (index == appConfig.activeServerIndex) {
-                                newConfig = newConfig.copy(
-                                    activeServerIndex = if (servers.isEmpty()) -1 else 0
-                                )
-                            } else if (index < appConfig.activeServerIndex) {
-                                newConfig = newConfig.copy(activeServerIndex = appConfig.activeServerIndex - 1)
-                            }
-                            saveConfig(newConfig)
-                            showDeleteConfirm = false
-                            closeEdit()
-                        }
-                    },
-                    onSetActive = {
-                        val index = editTarget?.index
-                        if (index != null) {
-                            saveConfig(appConfig.copy(activeServerIndex = index))
-                            closeEdit()
-                        }
-                    },
-                    onBack = { closeEdit() },
-                    onSave = { newServer ->
-                        val index = editTarget?.index ?: -1
-                        val servers = appConfig.servers.toMutableList()
-                        if (index >= 0) {
-                            servers[index] = newServer
-                        } else {
-                            servers.add(newServer)
-                        }
-                        var newConfig = appConfig.copy(servers = servers)
-                        if (appConfig.activeServerIndex < 0) {
-                            newConfig = newConfig.copy(activeServerIndex = 0)
-                        }
-                        saveConfig(newConfig)
-                        closeEdit()
-                        Toast.makeText(
-                            context,
-                            if (index >= 0) R.string.server_updated else R.string.server_added,
-                            Toast.LENGTH_SHORT
-                        ).show()
-                    }
-                )
-            }
-        }
-    }
+    ServerListPane(
+        appConfig = appConfig,
+        bottomPadding = bottomPadding,
+        canBack = canBack,
+        onBack = { activity?.finish() },
+        onAddServer = { openEditor(-1) },
+        onEditServer = { index -> openEditor(index) },
+    )
 }
 
 /**
