@@ -73,6 +73,9 @@ class SyncEngine private constructor() {
 
     companion object {
         private const val TAG = "SyncEngine"
+        private const val VERIFICATION_CLEANUP_DELAY_MS = 60_000L
+        private const val LOCAL_ECHO_DEDUP_RESET_DELAY_MS = 5_000L
+        private const val PREF_KEY_VERIFICATION_CLEANUP_TASKS = "verification_cleanup_tasks"
 
         @Volatile
         private var instance: SyncEngine? = null
@@ -91,6 +94,13 @@ class SyncEngine private constructor() {
     private var apiClient: SyncClipboardApi? = null
     private var appContext: Context? = null
     private var historyService: HistoryService? = null
+
+    /** 验证码清理任务：hash → 延迟 Job。到期时间另存 SharedPreferences，热重载后可恢复。 */
+    private val verificationCleanupJobs = java.util.concurrent.ConcurrentHashMap<String, Job>()
+    private val verificationCleanupPrefsLock = Any()
+
+    /** 已软删除历史的服务器重试任务，避免网络回调连续触发时重复并发。 */
+    private var historyDeleteFlushJob: Job? = null
 
     /** 历史服务懒加载：首次真正用到时才初始化（Room DB、目录），
      *  enableHistorySync=false 的用户不产生任何开销 */
@@ -257,6 +267,8 @@ class SyncEngine private constructor() {
         // 直接评估当前状态，避免 SignalR 在省电模式下持续在线
         reevaluatePowerSaveState()
         start()
+        restoreVerificationCleanupTasks()
+        flushPendingHistoryDeletes()
 
         Logger.info(TAG, "SyncEngine initialized, servers=${config.servers.size}, activeIdx=${config.activeServerIndex}")
     }
@@ -546,6 +558,8 @@ class SyncEngine private constructor() {
                         Logger.info(TAG, "Network available, flushing upload queue")
                         appContext?.let { flushUploadQueue(it) }
                     }
+                    // 删除墓碑独立于“历史同步”开关；网络恢复后始终补推服务器删除。
+                    flushPendingHistoryDeletes()
                     handleNetworkChange(cm)
                 }
                 override fun onLost(network: android.net.Network) {
@@ -659,7 +673,7 @@ class SyncEngine private constructor() {
         // 引擎侧短窗去重：多个来源（system_server 截获 + App 监听器）可能重复送达同一验证码
         if (!VerificationCodeExtractor.shouldForward(code)) return
         Logger.info(TAG, "Captured verification code from $pkg (length=${code.length})")
-        uploadText(code)
+        uploadText(code, verificationCode = true)
     }
 
     /** 配置变更后重新评估移动网络暂停状态 */
@@ -750,8 +764,11 @@ class SyncEngine private constructor() {
         isSignalRConnected = false
         historyPushConsumer?.cancel()
         historyPushConsumer = null
+        historyDeleteFlushJob?.cancel()
+        historyDeleteFlushJob = null
         // 取消轮询循环与所有后台协程（含 delay 中的等待）
         scope.coroutineContext[Job]?.cancelChildren()
+        verificationCleanupJobs.clear()
         // 拆除 IPC 路由：反注册 receiver，防止新旧两代并存双重处理
         SyncClipboardBridge.teardown()
         // 关闭历史数据库连接（旧代 Room 实例随类加载器一起废弃）
@@ -865,7 +882,7 @@ class SyncEngine private constructor() {
 
         scope.launch {
             try {
-                Logger.debug(TAG, "Local clipboard changed: ${content.text.take(50)}...")
+                Logger.debug(TAG, "Local clipboard changed: type=${content.type}, hash=${hash.take(12)}, textLength=${content.text.length}, hasData=${content.hasData}")
                 getHistoryService()?.addLocalContent(content)
                 notifyContentChanged()
                 if (config.enableAutoSync && config.enableBackgroundUpload) {
@@ -898,8 +915,13 @@ class SyncEngine private constructor() {
         }
         val oldServers = config.servers
         val oldActiveIdx = config.activeServerIndex
+        val cleanupWasEnabled = config.enableVerificationCodeAutoCleanup
         config = newConfig
+        if (cleanupWasEnabled && !newConfig.enableVerificationCodeAutoCleanup) {
+            cancelVerificationCleanupTasks(clearPersisted = true)
+        }
         rebuildApiClient()  // 内部会重建 SignalR 客户端
+        flushPendingHistoryDeletes()
         // 重新评估省电模式：用户可能在省电模式已开启时才打开“省电停止”开关
         reevaluatePowerSaveState()
         // 配置变更后重启 SignalR 连接（自动同步开启且未被息屏/省电暂停时）
@@ -914,8 +936,16 @@ class SyncEngine private constructor() {
         val serverChanged = oldServers != newConfig.servers || oldActiveIdx != newConfig.activeServerIndex
         if (serverChanged) {
             lastSyncTime = 0L
-            appContext?.let { Prefs.resetHistoryLastSyncTime(it) }
-            Logger.info(TAG, "Server changed, history sync cursor reset")
+            lastRemoteHash = null
+            lastRemoteProfile = null
+            lastRemoteFilePath = null
+            appContext?.let {
+                Prefs.resetHistoryLastSyncTime(it)
+                Prefs.saveLastRemoteHash(it, null)
+                Prefs.saveLastRemoteProfile(it, null)
+                Prefs.saveLastRemoteFilePath(it, null)
+            }
+            Logger.info(TAG, "Server changed, history cursor and remote content cache reset")
         }
         // 总开关关闭时：立即置为未连接并停止轮询；断开 SignalR 并清除
         // 息屏/省电/移动网络暂停标志，避免状态残留导致亮屏后触发无意义的 resume 流程
@@ -1143,9 +1173,20 @@ class SyncEngine private constructor() {
             )
             var result = client.updateHistoryRecord(item.type, item.profileHash, update)
             if (result == null) {
-                // 404：服务器不存在，降级为 LocalOnly（与 RN RecordNotFoundError 一致）
-                hs.markAsLocalOnly(item.profileHash)
-                PatchOutcome.NOT_FOUND
+                // 删除请求返回 404 说明服务器端目标已不存在，删除目的已经达成。
+                // 普通元数据更新返回 404 才降级为 LocalOnly，等待重新上传。
+                if (item.isDeleted) {
+                    hs.markAsSynced(item.profileHash)
+                    PatchOutcome.SUCCESS
+                } else {
+                    hs.markAsLocalOnly(item.profileHash)
+                    PatchOutcome.NOT_FOUND
+                }
+            } else if (item.isDeleted && result.isDeleted == true) {
+                // 删除成功时服务器通常会递增 version；以 isDeleted=true 作为明确成功信号，
+                // 避免把正常的版本递增误判成 409 冲突并重复 PATCH。
+                hs.applyServerUpdate(item.profileHash, result)
+                PatchOutcome.SUCCESS
             } else if (result.version != item.version) {
                 // 409 冲突：服务器 version 较新
                 // 仅更新本地 version，保持 NeedSync 和 isDeleted，然后重试一次
@@ -1161,12 +1202,26 @@ class SyncEngine private constructor() {
                     )
                     val retryResult = client.updateHistoryRecord(retryItem.type, retryItem.profileHash, update)
                     if (retryResult == null) {
-                        hs.markAsLocalOnly(retryItem.profileHash)
-                        PatchOutcome.NOT_FOUND
-                    } else if (retryResult.version != retryItem.version) {
-                        // 仍然冲突：放弃，以服务器为准
+                        if (retryItem.isDeleted) {
+                            hs.markAsSynced(retryItem.profileHash)
+                            PatchOutcome.SUCCESS
+                        } else {
+                            hs.markAsLocalOnly(retryItem.profileHash)
+                            PatchOutcome.NOT_FOUND
+                        }
+                    } else if (retryItem.isDeleted && retryResult.isDeleted == true) {
                         hs.applyServerUpdate(retryItem.profileHash, retryResult)
-                        PatchOutcome.CONFLICT
+                        PatchOutcome.SUCCESS
+                    } else if (retryResult.version != retryItem.version) {
+                        if (retryItem.isDeleted) {
+                            // 删除不能因连续版本冲突被服务器旧值复活；更新版本并保留 NeedSync 墓碑，稍后重试。
+                            hs.updateVersionOnly(retryItem.profileHash, retryResult)
+                            PatchOutcome.FAILED
+                        } else {
+                            // 普通元数据连续冲突时仍以服务器为准。
+                            hs.applyServerUpdate(retryItem.profileHash, retryResult)
+                            PatchOutcome.CONFLICT
+                        }
                     } else {
                         hs.applyServerUpdate(retryItem.profileHash, retryResult)
                         PatchOutcome.SUCCESS
@@ -1262,14 +1317,15 @@ class SyncEngine private constructor() {
      * 直接上传一段文本（如短信验证码）到服务器，绕过 autoSync/bgUpload 开关。
      * 上传前先复制到剪贴板，并通过 profileHash 去重，避免相同内容重复上传。
      */
-    fun uploadText(text: String) {
+    fun uploadText(text: String, verificationCode: Boolean = false) {
         if (appContext == null || text.isBlank()) return
         scope.launch {
             try {
                 // 先设置 lastLocalHash，阻止 clipChangedListener 在 setPrimaryClip 后把相同
                 // 内容当作"新剪贴板变化"再次上传（clipChangedListener 在主线程异步回调，若
                 // hash 未先设置将触发第二次 uploadContent，造成重复上传）
-                lastLocalHash = HashUtils.sha256(text)
+                val localHash = HashUtils.sha256(text)
+                synchronized(localDedupLock) { lastLocalHash = localHash }
 
                 // 1. 服务端去重：profileHash 与上次上传内容相同则只复制不上传
                 val profileHash = HashUtils.sha256(text)
@@ -1289,9 +1345,15 @@ class SyncEngine private constructor() {
                         Logger.warn(TAG, "uploadText: clipboard copy failed: ${e.message}")
                     }
                 }
+                // 不再依赖 60 秒后的剪贴板清理来复位去重标记；仅保留短时窗口抑制本次 setPrimaryClip 的回声。
+                scheduleLocalEchoDedupReset(localHash)
 
                 if (alreadyRemote) {
                     Logger.info(TAG, "uploadText: skipped upload (already remote)")
+                    if (verificationCode && config.enableVerificationCodeAutoCleanup) {
+                        ensureVerificationHistory(text, profileHash)
+                        scheduleVerificationCleanup(profileHash)
+                    }
                     return@launch
                 }
 
@@ -1299,15 +1361,159 @@ class SyncEngine private constructor() {
                     type = ClipboardContentType.Text,
                     text = text,
                     hasData = false,
+                    profileHash = profileHash,
                     timestamp = System.currentTimeMillis()
                 )
                 getHistoryService()?.addLocalContent(content)
                 notifyContentChanged()
                 val ok = uploadContent(content)
+                if (ok && verificationCode && config.enableVerificationCodeAutoCleanup) {
+                    scheduleVerificationCleanup(profileHash)
+                }
                 // 历史同步改为手动触发，上传后不再自动 syncHistory
-                Logger.info(TAG, "uploadText: ok=$ok text=${text.take(20)}")
+                Logger.info(TAG, "uploadText: ok=$ok hash=${profileHash.take(12)}, verification=$verificationCode")
             } catch (e: Exception) {
                 Logger.error(TAG, "uploadText failed", e)
+            }
+        }
+    }
+
+    /** 远端内容已存在但本地没有对应历史时，补建本地记录以便定时删除时带版本同步服务器。 */
+    private fun ensureVerificationHistory(text: String, profileHash: String) {
+        val hs = getHistoryService() ?: return
+        val existing = hs.getItemByProfileHash(profileHash)
+        if (existing == null || existing.isDeleted) {
+            hs.addLocalContent(ClipboardContent(
+                type = ClipboardContentType.Text,
+                text = text,
+                hasData = false,
+                profileHash = profileHash,
+                timestamp = System.currentTimeMillis()
+            ))
+            notifyContentChanged()
+        }
+    }
+
+    /** 延迟释放由模块写入剪贴板产生的回声去重标记，避免它永久阻塞相同内容的新事件。 */
+    private fun scheduleLocalEchoDedupReset(expectedHash: String) {
+        scope.launch {
+            delay(LOCAL_ECHO_DEDUP_RESET_DELAY_MS)
+            synchronized(localDedupLock) {
+                if (lastLocalHash.equals(expectedHash, ignoreCase = true)) {
+                    lastLocalHash = null
+                }
+            }
+        }
+    }
+
+    /**
+     * 持久化并安排验证码清理。只保存内容 hash 与到期时间，不保存验证码明文。
+     */
+    private fun scheduleVerificationCleanup(
+        profileHash: String,
+        dueAt: Long = System.currentTimeMillis() + VERIFICATION_CLEANUP_DELAY_MS,
+        persist: Boolean = true
+    ) {
+        if (!config.enableVerificationCodeAutoCleanup) return
+        val key = profileHash.lowercase()
+        if (persist) saveVerificationCleanupTask(key, dueAt)
+
+        verificationCleanupJobs.remove(key)?.cancel()
+        verificationCleanupJobs[key] = scope.launch {
+            val waitMs = (dueAt - System.currentTimeMillis()).coerceAtLeast(0L)
+            delay(waitMs)
+            while (isActive) {
+                try {
+                    performVerificationCleanup(key)
+                    removeVerificationCleanupTask(key)
+                    verificationCleanupJobs.remove(key)
+                    break
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    // 本地数据库暂不可用时保留持久化任务，并在当前进程内继续重试。
+                    Logger.warn(TAG, "Verification cleanup failed for ${key.take(12)}: ${e.message}")
+                    delay(30_000L)
+                }
+            }
+        }
+        Logger.info(TAG, "Verification cleanup scheduled: hash=${key.take(12)}, dueIn=${(dueAt - System.currentTimeMillis()).coerceAtLeast(0L)}ms")
+    }
+
+    /** 恢复 SystemUI 重启或模块热重载前尚未执行的验证码清理任务。 */
+    private fun restoreVerificationCleanupTasks() {
+        if (!config.enableVerificationCodeAutoCleanup) {
+            cancelVerificationCleanupTasks(clearPersisted = true)
+            return
+        }
+        loadVerificationCleanupTasks().forEach { (hash, dueAt) ->
+            scheduleVerificationCleanup(hash, dueAt, persist = false)
+        }
+    }
+
+    private suspend fun performVerificationCleanup(profileHash: String) {
+        val tombstone = getHistoryService()?.deleteByProfileHash(profileHash)
+        if (tombstone != null) {
+            notifyContentChanged()
+            // 删除操作不受历史同步开关影响；失败会留下 NeedSync 墓碑，网络恢复后重试。
+            pushSingleHistoryUpdate(tombstone.id)
+            Logger.info(TAG, "Verification history cleaned: hash=${profileHash.take(12)}")
+        } else {
+            Logger.info(TAG, "Verification cleanup: no history item for hash=${profileHash.take(12)}")
+        }
+    }
+
+    private fun loadVerificationCleanupTasks(): Map<String, Long> {
+        val ctx = appContext ?: return emptyMap()
+        val values = Prefs.getPrefs(ctx)
+            .getStringSet(PREF_KEY_VERIFICATION_CLEANUP_TASKS, emptySet())
+            ?.toSet()
+            .orEmpty()
+        return buildMap {
+            for (value in values) {
+                val separator = value.lastIndexOf(':')
+                if (separator <= 0) continue
+                val hash = value.substring(0, separator).lowercase()
+                val dueAt = value.substring(separator + 1).toLongOrNull() ?: continue
+                put(hash, dueAt)
+            }
+        }
+    }
+
+    private fun saveVerificationCleanupTask(profileHash: String, dueAt: Long) {
+        val ctx = appContext ?: return
+        synchronized(verificationCleanupPrefsLock) {
+            val tasks = loadVerificationCleanupTasks().toMutableMap()
+            tasks[profileHash.lowercase()] = dueAt
+            Prefs.getPrefs(ctx).edit()
+                .putStringSet(
+                    PREF_KEY_VERIFICATION_CLEANUP_TASKS,
+                    tasks.mapTo(mutableSetOf()) { (hash, time) -> "$hash:$time" }
+                )
+                .apply()
+        }
+    }
+
+    private fun removeVerificationCleanupTask(profileHash: String) {
+        val ctx = appContext ?: return
+        synchronized(verificationCleanupPrefsLock) {
+            val tasks = loadVerificationCleanupTasks().toMutableMap()
+            tasks.remove(profileHash.lowercase())
+            Prefs.getPrefs(ctx).edit()
+                .putStringSet(
+                    PREF_KEY_VERIFICATION_CLEANUP_TASKS,
+                    tasks.mapTo(mutableSetOf()) { (hash, time) -> "$hash:$time" }
+                )
+                .apply()
+        }
+    }
+
+    private fun cancelVerificationCleanupTasks(clearPersisted: Boolean) {
+        verificationCleanupJobs.values.forEach { it.cancel() }
+        verificationCleanupJobs.clear()
+        if (clearPersisted) {
+            appContext?.let { ctx ->
+                Prefs.getPrefs(ctx).edit().remove(PREF_KEY_VERIFICATION_CLEANUP_TASKS).apply()
             }
         }
     }
@@ -1372,6 +1578,7 @@ class SyncEngine private constructor() {
     fun clearEngineData() {
         scope.launch {
             try {
+                cancelVerificationCleanupTasks(clearPersisted = true)
                 getHistoryService()?.clearAll()
                 appContext?.let { ctx ->
                     // 历史归档文件目录（history_files）应一并清空：clearAll 仅按 DB 活跃记录的 fileUri
@@ -1434,7 +1641,7 @@ class SyncEngine private constructor() {
                 Logger.warn(TAG, "fetchRemoteClipboard: getClipboard returned null")
                 return false
             }
-            Logger.info(TAG, "fetchRemoteClipboard: type=${fetched.type}, hash=${fetched.hash}, text=${fetched.text.take(50)}, hasData=${fetched.hasData}")
+            Logger.info(TAG, "fetchRemoteClipboard: type=${fetched.type}, hash=${fetched.hash?.take(12)}, textLength=${fetched.text.length}, hasData=${fetched.hasData}")
             val fetchedHash = fetched.hash
             if (fetchedHash == null) {
                 setConnected(false)
@@ -1482,7 +1689,7 @@ class SyncEngine private constructor() {
             // 文件下载/历史记录/自动保存由 notifyAndApplyAsync 后台继续，避免大文件阻塞 UI
             lastRemoteHash = hash
             appContext?.let { Prefs.saveLastRemoteHash(it, hash) }
-            Logger.info(TAG, "Remote clipboard changed: ${profile.text.take(50)}...")
+            Logger.info(TAG, "Remote clipboard changed: type=${profile.type}, hash=${profile.hash?.take(12)}, textLength=${profile.text.length}")
 
             if (force || config.enableBackgroundDownload) {
                 notifyAndApplyAsync(profile)
@@ -1581,7 +1788,7 @@ class SyncEngine private constructor() {
                     } else {
                         // 单条失败：记录重试次数，超过上限丢弃（防止死循环堆积）
                         UploadQueue.markRetry(context, key)
-                        Logger.warn(TAG, "Upload queue flush failed (retry=${item.retryCount + 1}): ${item.content.text.take(30)}")
+                        Logger.warn(TAG, "Upload queue flush failed (retry=${item.retryCount + 1}, key=${key.take(12)}, textLength=${item.content.text.length})")
                         if (item.retryCount >= MAX_UPLOAD_RETRY) {
                             Logger.warn(TAG, "Upload queue: dropping item after $MAX_UPLOAD_RETRY retries")
                             UploadQueue.remove(context, key)
@@ -1852,7 +2059,7 @@ class SyncEngine private constructor() {
             val clipData = android.content.ClipData.newPlainText("SyncClipboard", text)
             clipboardManager.setPrimaryClip(clipData)
 
-            Logger.debug(TAG, "Written to clipboard: ${text.take(50)}...")
+            Logger.debug(TAG, "Written to clipboard: textLength=${text.length}")
         } catch (e: Exception) {
             Logger.error(TAG, "Failed to write to clipboard", e)
         }
@@ -2090,24 +2297,56 @@ class SyncEngine private constructor() {
     /** 单条历史记录变更后即时 PATCH 推送到服务器。
      *  获取 historySyncMutex 避免与 syncHistory 并发，复用 processPatchItem 逻辑。
      *  仅 SyncClipboard 官方服务器模式生效；WebDAV/S3 不支持历史 PATCH，仅做本地变更。 */
-    private suspend fun pushSingleHistoryUpdate(id: String) {
-        // 历史同步总开关关闭时：完全断开与服务器的历史交互（含星标/置顶等单条元数据推送）
-        if (!config.enableHistorySync) return
-        val hs = getHistoryService() ?: return
-        val client = apiClient ?: return
+    private suspend fun pushSingleHistoryUpdate(id: String): PatchOutcome? {
+        val hs = getHistoryService() ?: return null
+        val initial = hs.getByIdIncludingDeleted(id) ?: return null
+        // 星标/置顶仍受历史同步开关控制；删除是用户的显式操作，始终尝试同步到服务器。
+        if (!initial.isDeleted && !config.enableHistorySync) return null
         val server = config.servers.getOrNull(config.activeServerIndex)
-        if (server == null || server.type != ServerType.syncclipboard) return
-        val item = hs.getById(id) ?: return
-        if (item.syncStatus != HistorySyncStatus.NeedSync) return
-        historySyncMutex.withLock {
+        if (server == null || server.type != ServerType.syncclipboard) return null
+        val client = apiClient ?: return PatchOutcome.FAILED
+        if (initial.syncStatus != HistorySyncStatus.NeedSync) return null
+        return historySyncMutex.withLock {
             // 重新读取，避免在等待锁期间状态被其他流程改变
-            val current = hs.getById(id) ?: return@withLock
-            if (current.syncStatus != HistorySyncStatus.NeedSync) return@withLock
+            val current = hs.getByIdIncludingDeleted(id) ?: return@withLock null
+            if (current.syncStatus != HistorySyncStatus.NeedSync) return@withLock null
             try {
                 val outcome = processPatchItem(current, client, hs)
                 Logger.info(TAG, "pushSingleHistoryUpdate: hash=${current.profileHash}, outcome=$outcome")
+                outcome
             } catch (e: Exception) {
                 Logger.warn(TAG, "pushSingleHistoryUpdate failed: ${e.message}")
+                PatchOutcome.FAILED
+            }
+        }
+    }
+
+    /** 重试所有本地删除墓碑。删除同步独立于历史同步开关，避免关闭历史同步时服务器残留。 */
+    private fun flushPendingHistoryDeletes() {
+        if (historyDeleteFlushJob?.isActive == true) return
+        historyDeleteFlushJob = scope.launch {
+            try {
+                var retryDelayMs = 30_000L
+                while (isActive) {
+                    val pending = getHistoryService()?.getNeedSyncItems()
+                        ?.filter { it.isDeleted }
+                        .orEmpty()
+                    if (pending.isEmpty()) break
+
+                    var transientFailure = false
+                    for (item in pending) {
+                        if (pushSingleHistoryUpdate(item.id) == PatchOutcome.FAILED) {
+                            transientFailure = true
+                        }
+                    }
+                    if (!transientFailure) break
+
+                    Logger.info(TAG, "Pending history deletes will retry in ${retryDelayMs}ms")
+                    delay(retryDelayMs)
+                    retryDelayMs = (retryDelayMs * 2).coerceAtMost(5 * 60_000L)
+                }
+            } catch (e: Exception) {
+                Logger.warn(TAG, "Pending history delete flush failed: ${e.message}")
             }
         }
     }
@@ -2174,7 +2413,8 @@ class SyncEngine private constructor() {
 
             onCommand(BridgeKeys.UPLOAD_TEXT) { data ->
                 val text = data.getString("text") ?: return@onCommand
-                uploadText(text)
+                val verificationCode = data.getBoolean("verificationCode", false)
+                uploadText(text, verificationCode)
             }
 
             onCommand(BridgeKeys.REGISTER_UPLOADED) { data ->
@@ -2308,8 +2548,12 @@ class SyncEngine private constructor() {
 
             onCommand(BridgeKeys.DELETE_HISTORY_ITEM) { data ->
                 val id = data.getString("id") ?: return@onCommand
-                getHistoryService()?.delete(id)
-                Logger.info(TAG, "History item deleted: $id")
+                val tombstone = getHistoryService()?.delete(id)
+                if (tombstone != null) {
+                    notifyContentChanged()
+                    val outcome = pushSingleHistoryUpdate(tombstone.id)
+                    Logger.info(TAG, "History item deleted locally and pushed to server: $id, outcome=$outcome")
+                }
             }
 
             onCommand(BridgeKeys.UPDATE_HISTORY_ITEM) { data ->

@@ -183,6 +183,8 @@
     <string name="setting_sms_upload_summary">收到含验证码的短信时，自动提取并上传到剪贴板服务器</string>
     <string name="setting_notification_upload">自动上传通知验证码</string>
     <string name="setting_notification_upload_summary">自动提取应用通知中的验证码并上传（系统级截获，无需通知使用权）</string>
+    <string name="setting_verification_code_auto_cleanup">自动清理已上传验证码</string>
+    <string name="setting_verification_code_auto_cleanup_summary">验证码上传成功 60 秒后删除对应历史，并同步删除服务器端记录</string>
     <string name="setting_language">语言</string>
     <string name="setting_language_auto">跟随系统</string>
     <string name="setting_language_zh">中文</string>

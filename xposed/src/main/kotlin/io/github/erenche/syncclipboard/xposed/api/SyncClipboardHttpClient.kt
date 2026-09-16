@@ -350,7 +350,7 @@ class SyncClipboardHttpClient(
             }
             if (response.status.value !in 200..299) {
                 Logger.warn(TAG, "updateHistoryRecord: server returned ${response.status.value}")
-                return null
+                throw IllegalStateException("History PATCH failed: HTTP ${response.status.value}")
             }
             // 服务器可能返回 200/204 无响应体（成功但无内容）
             val body = response.bodyAsText()
@@ -372,7 +372,9 @@ class SyncClipboardHttpClient(
             json.decodeFromString(HistoryRecordDto.serializer(), body)
         } catch (e: Exception) {
             Logger.warn(TAG, "Failed to update history record: ${e.message}")
-            null
+            // null 只表示明确的 404；网络异常与 5xx 必须向上传递，
+            // 否则删除逻辑会把临时失败误判为“服务器已不存在”并丢掉重试墓碑。
+            throw e
         }
     }
 

@@ -59,9 +59,12 @@ data class AppConfig(
     val enableAutoSave: Boolean = false,
     /** 自动上传短信验证码：收到含验证码的短信时自动提取并上传到服务器 */
     val enableSmsUpload: Boolean = false,
-    /** 自动上传通知验证码：监听所有应用通知，提取验证码后上传到服务器。
-     *  需要用户在系统设置中授予"通知访问权限"。独立于 [enableSmsUpload]。 */
+    /** 自动上传通知验证码：由 system_server 截获通知正文，提取验证码后上传到服务器。
+     *  不需要用户授予通知访问权限。独立于 [enableSmsUpload]。 */
     val enableNotificationUpload: Boolean = false,
+    /** 验证码上传成功 60 秒后，自动删除对应历史记录并同步服务器。
+     *  仅影响由短信/通知自动提取的验证码，不影响手动复制或分享的普通文本。 */
+    val enableVerificationCodeAutoCleanup: Boolean = false,
     /** 是否启用 SignalR 推送（仅 SyncClipboard 官方服务器模式生效）。
      *  开启后通过 WebSocket 长连接接收服务器推送，轮询降级为 60s 兜底；
      *  WebDAV/S3 模式忽略此选项，始终走轮询。 */
