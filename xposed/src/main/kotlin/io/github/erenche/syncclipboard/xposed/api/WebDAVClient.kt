@@ -93,10 +93,14 @@ class WebDAVClient(
     }
 
     override suspend fun putClipboard(profile: ProfileDto) {
-        client.put("$baseUrl/$CLIPBOARD_FILE") {
+        val response = client.put("$baseUrl/$CLIPBOARD_FILE") {
             header(HttpHeaders.Authorization, buildAuthHeader())
             contentType(ContentType.Application.Json)
             setBody(Json.encodeToString(ProfileDto.serializer(), profile))
+        }
+        if (!response.status.isSuccess()) {
+            runCatching { response.bodyAsText() }
+            throw IllegalStateException("WebDAV clipboard upload failed: HTTP ${response.status.value}")
         }
     }
 
@@ -132,9 +136,13 @@ class WebDAVClient(
             onProgress?.invoke(sent, total)
         }
         val encodedName = URLEncoder.encode(fileName, "UTF-8").replace("+", "%20")
-        client.put("$baseUrl/$DATA_DIR/$encodedName") {
+        val response = client.put("$baseUrl/$DATA_DIR/$encodedName") {
             header(HttpHeaders.Authorization, buildAuthHeader())
             setBody(body)
+        }
+        if (!response.status.isSuccess()) {
+            runCatching { response.bodyAsText() }
+            throw IllegalStateException("WebDAV file upload failed: HTTP ${response.status.value}")
         }
     }
 

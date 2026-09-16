@@ -14,6 +14,8 @@ import io.ktor.client.call.body
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.forms.formData
+import io.ktor.client.request.forms.InputProvider
+import io.ktor.client.request.forms.MultiPartFormDataContent
 import io.ktor.client.request.forms.submitFormWithBinaryData
 import io.ktor.client.request.get
 import io.ktor.client.request.header
@@ -30,6 +32,8 @@ import io.ktor.http.contentType
 import io.ktor.http.Headers
 import io.ktor.http.HttpHeaders as KtorHttpHeaders
 import io.ktor.serialization.kotlinx.json.json
+import io.ktor.utils.io.streams.asInput
+import kotlinx.io.buffered
 import io.ktor.utils.io.readAvailable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
@@ -84,8 +88,9 @@ class SyncClipboardHttpClient(
             }
             Logger.debug(TAG, "GET $baseUrl$CLIPBOARD_ENDPOINT -> status=${response.status.value}")
             if (response.status.value !in 200..299) {
-                val body = response.bodyAsText()
-                Logger.warn(TAG, "Server returned ${response.status.value}: ${body.take(300)}")
+                // 错误响应也可能包含远端剪贴板内容，消费但不写入日志。
+                runCatching { response.bodyAsText() }
+                Logger.warn(TAG, "Server returned ${response.status.value}")
                 return null
             }
             response.body<ProfileDto>()
@@ -96,12 +101,16 @@ class SyncClipboardHttpClient(
     }
 
     override suspend fun putClipboard(profile: ProfileDto) {
-        client.put("$baseUrl$CLIPBOARD_ENDPOINT") {
+        val response = client.put("$baseUrl$CLIPBOARD_ENDPOINT") {
             if (username != null && password != null) {
                 header(HttpHeaders.Authorization, buildAuthHeader())
             }
             contentType(ContentType.Application.Json)
             setBody(profile)
+        }
+        if (response.status.value !in 200..299) {
+            runCatching { response.bodyAsText() }
+            throw IllegalStateException("Clipboard upload failed: HTTP ${response.status.value}")
         }
     }
 
@@ -119,8 +128,8 @@ class SyncClipboardHttpClient(
             }
         }
         if (response.status.value !in 200..299) {
-            val body = try { response.bodyAsText() } catch (_: Exception) { "" }
-            Logger.warn(TAG, "downloadFile: server returned ${response.status.value}: ${body.take(300)}")
+            runCatching { response.bodyAsText() }
+            Logger.warn(TAG, "downloadFile: server returned ${response.status.value}")
             throw IllegalStateException("File download failed: server returned ${response.status.value}")
         }
         // 流式写入：大文件不整体读入内存
@@ -151,11 +160,15 @@ class SyncClipboardHttpClient(
         val body = CountingFileContent(file, ContentType.Application.OctetStream) { sent ->
             onProgress?.invoke(sent, total)
         }
-        client.put("$baseUrl$FILE_ENDPOINT${java.net.URLEncoder.encode(fileName, "UTF-8").replace("+", "%20")}") {
+        val response = client.put("$baseUrl$FILE_ENDPOINT${java.net.URLEncoder.encode(fileName, "UTF-8").replace("+", "%20")}") {
             if (username != null && password != null) {
                 header(HttpHeaders.Authorization, buildAuthHeader())
             }
             setBody(body)
+        }
+        if (response.status.value !in 200..299) {
+            runCatching { response.bodyAsText() }
+            throw IllegalStateException("File upload failed: HTTP ${response.status.value}")
         }
     }
 
@@ -192,8 +205,8 @@ class SyncClipboardHttpClient(
             }
         }
         if (response.status.value !in 200..299) {
-            val body = response.bodyAsText()
-            throw IllegalStateException("Server returned ${response.status.value}: ${body.take(200)}")
+            runCatching { response.bodyAsText() }
+            throw IllegalStateException("Server returned ${response.status.value}")
         }
         Logger.info(TAG, "Connection test successful")
     }
@@ -227,13 +240,14 @@ class SyncClipboardHttpClient(
                 }
             }
             if (response.status.value !in 200..299) {
-                val errorBody = try { response.bodyAsText() } catch (_: Exception) { "" }
-                val msg = "Server returned ${response.status.value}: ${errorBody.take(300)}"
+                runCatching { response.bodyAsText() }
+                val msg = "Server returned ${response.status.value}"
                 Logger.warn(TAG, "queryHistoryRecords: $msg")
                 throw IllegalStateException(msg)
             }
             val body = response.bodyAsText()
-            Logger.info(TAG, "queryHistoryRecords: POST -> 200, body length=${body.length}, preview=${body.take(500)}")
+            // 历史响应中可能包含短信验证码、密码或其他剪贴板明文，只记录长度和数量。
+            Logger.info(TAG, "queryHistoryRecords: POST -> 200, body length=${body.length}")
             if (body.isBlank() || body == "[]") {
                 Logger.info(TAG, "queryHistoryRecords: empty result (end of pages)")
                 return emptyList()
@@ -265,25 +279,30 @@ class SyncClipboardHttpClient(
                 record.version?.let { put("version", it.toString()) }
             }
 
-            val response = client.submitFormWithBinaryData(
-                url = "$baseUrl$HISTORY_API",
-                formData = formData {
-                    fields.forEach { (key, value) ->
-                        append(key, value)
-                    }
-                    if (filePath != null) {
-                        val file = File(filePath)
-                        if (file.exists()) {
-                            append("file", file.readBytes(), Headers.build {
-                                set(HttpHeaders.ContentDisposition, "filename=\"${file.name}\"")
-                            })
-                        }
-                    }
-                }
-            ) {
+            val dataFile = filePath?.let { File(it) }
+            if (record.hasData == true && (dataFile == null || !dataFile.isFile)) {
+                throw IllegalStateException("History data file not found for ${record.hash}")
+            }
+
+            val response = client.post("$baseUrl$HISTORY_API") {
                 if (username != null && password != null) {
                     header(HttpHeaders.Authorization, buildAuthHeader())
                 }
+                setBody(MultiPartFormDataContent(formData {
+                    fields.forEach { (key, value) ->
+                        append(key, value)
+                    }
+                    if (dataFile != null) {
+                        append(
+                            "data",
+                            InputProvider { dataFile.inputStream().asInput().buffered() },
+                            Headers.build {
+                                set(HttpHeaders.ContentType, ContentType.Application.OctetStream.toString())
+                                set(HttpHeaders.ContentDisposition, "filename=\"${dataFile.name}\"")
+                            }
+                        )
+                    }
+                }))
             }
             if (response.status.value == 409) {
                 // 冲突：服务器已有此记录，返回服务器现有记录（与 RN SyncConflictError 一致）
@@ -350,19 +369,19 @@ class SyncClipboardHttpClient(
             }
             if (response.status.value !in 200..299) {
                 Logger.warn(TAG, "updateHistoryRecord: server returned ${response.status.value}")
-                return null
+                throw IllegalStateException("History PATCH failed: HTTP ${response.status.value}")
             }
             // 服务器可能返回 200/204 无响应体（成功但无内容）
             val body = response.bodyAsText()
             if (body.isBlank()) {
                 Logger.debug(TAG, "updateHistoryRecord: success (empty body) for $hash")
-                // 返回 dummy DTO 表示成功（调用方用 applyServerUpdate 标记 Synced）
-                // 服务器 PATCH 成功后 version 会递增，本地需同步递增，否则下次 PATCH 会 409
+                // 成功 PATCH 返回空 200；服务端使用请求中的 version，不会自动递增。
+                // 返回请求版本即可，避免本地版本号比服务端多 1。
                 return HistoryRecordDto(
                     hash = hash,
                     text = "",
                     type = type,
-                    version = (update.version ?: 0) + 1,
+                    version = update.version,
                     isDeleted = update.isDelete,
                     starred = update.starred,
                     pinned = update.pinned,
@@ -372,7 +391,9 @@ class SyncClipboardHttpClient(
             json.decodeFromString(HistoryRecordDto.serializer(), body)
         } catch (e: Exception) {
             Logger.warn(TAG, "Failed to update history record: ${e.message}")
-            null
+            // null 只表示明确的 404；网络异常与 5xx 必须向上传递，
+            // 否则删除逻辑会把临时失败误判为“服务器已不存在”并丢掉重试墓碑。
+            throw e
         }
     }
 

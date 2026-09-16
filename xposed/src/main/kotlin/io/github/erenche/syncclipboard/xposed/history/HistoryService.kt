@@ -83,20 +83,34 @@ class HistoryService(context: Context) {
     fun getById(id: String): HistoryItem? =
         dao.getById(id)?.toModel()?.takeIf { !it.isDeleted }
 
+    /** 按 ID 获取记录，包含软删除墓碑（用于把删除操作同步到服务器）。 */
+    fun getByIdIncludingDeleted(id: String): HistoryItem? =
+        dao.getById(id)?.toModel()
+
     /**
      * 本地剪贴板变化时调用。
      * syncStatus = LocalOnly，如有文件复制到持久化历史目录。
      */
     fun addLocalContent(content: ClipboardContent) {
         val hash = (content.profileHash ?: computeHashForContent(content)).lowercase()
-        Logger.info(TAG, "addLocalContent: type=${content.type}, hash=$hash, text=${content.text.take(50)}, hasData=${content.hasData}")
+        Logger.info(TAG, "addLocalContent: type=${content.type}, hash=${hash.take(12)}, textLength=${content.text.length}, hasData=${content.hasData}")
         db.runInTransaction {
             val existing = dao.getByProfileHash(hash)?.toModel()
-            if (existing != null && !existing.isDeleted) {
-                // 已存在，更新 syncStatus 和 lastAccessed
+            if (existing != null) {
+                // 已存在时复用原记录（含已软删除项），避免 profileHash 唯一索引冲突。
+                // 相同内容之后再次由本机产生，应视为一次新的活跃内容。
+                val now = System.currentTimeMillis()
                 dao.upsert(HistoryItemEntity.from(existing.copy(
+                    type = content.type,
+                    text = content.text,
+                    hasData = content.hasData,
+                    dataName = content.fileName,
+                    size = content.fileSize,
+                    timestamp = content.timestamp,
                     syncStatus = HistorySyncStatus.LocalOnly,
-                    lastAccessed = System.currentTimeMillis()
+                    lastModified = now,
+                    lastAccessed = now,
+                    isDeleted = false
                 )))
             } else {
                 // 新增：如有文件，复制到持久化目录
@@ -133,7 +147,7 @@ class HistoryService(context: Context) {
      */
     fun addRemoteContent(content: ClipboardContent, downloadPath: String? = null) {
         val hash = (content.profileHash ?: HashUtils.sha256(content.text)).lowercase()
-        Logger.info(TAG, "addRemoteContent: type=${content.type}, hash=$hash, text=${content.text.take(50)}, hasData=${content.hasData}, downloadPath=$downloadPath")
+        Logger.info(TAG, "addRemoteContent: type=${content.type}, hash=${hash.take(12)}, textLength=${content.text.length}, hasData=${content.hasData}, downloadPath=$downloadPath")
         db.runInTransaction {
             val existing = dao.getByProfileHash(hash)?.toModel()
             if (existing != null && !existing.isDeleted) {
@@ -205,17 +219,25 @@ class HistoryService(context: Context) {
         }
     }
 
-    fun delete(id: String) {
-        val item = dao.getById(id)?.toModel() ?: return
-        // 标记 NeedSync 以便下次同步推送删除事件到服务器
-        val newStatus = if (item.syncStatus == HistorySyncStatus.Synced) HistorySyncStatus.NeedSync else item.syncStatus
-        dao.upsert(HistoryItemEntity.from(item.copy(
+    fun delete(id: String): HistoryItem? {
+        val item = dao.getById(id)?.toModel() ?: return null
+        if (item.isDeleted) return item
+        // 所有删除都写成 NeedSync 墓碑；SyncEngine 会立即 PATCH 服务器，失败时保留墓碑重试。
+        val tombstone = item.copy(
             isDeleted = true,
-            syncStatus = newStatus,
+            syncStatus = HistorySyncStatus.NeedSync,
             lastModified = System.currentTimeMillis()
-        )))
+        )
+        dao.upsert(HistoryItemEntity.from(tombstone))
         // 清理持久化的物理文件
         deleteHistoryFile(item.fileUri)
+        return tombstone
+    }
+
+    /** 按 profileHash 删除，供验证码定时清理精确定位对应历史项。 */
+    fun deleteByProfileHash(profileHash: String): HistoryItem? {
+        val item = dao.getByProfileHash(profileHash)?.toModel() ?: return null
+        return delete(item.id)
     }
 
     /** 清空所有历史记录（软删除） */
@@ -537,7 +559,7 @@ class HistoryService(context: Context) {
     /** 标记某项已成功上传到服务器 */
     fun markAsSynced(profileHash: String) {
         val item = dao.getByProfileHash(profileHash)?.toModel() ?: return
-        if (!item.isDeleted && item.syncStatus != HistorySyncStatus.Synced) {
+        if (item.syncStatus != HistorySyncStatus.Synced) {
             dao.upsert(HistoryItemEntity.from(item.copy(syncStatus = HistorySyncStatus.Synced)))
         }
     }

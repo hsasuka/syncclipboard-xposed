@@ -183,6 +183,8 @@
     <string name="setting_sms_upload_summary">Auto-upload SMS verification codes to the clipboard server</string>
     <string name="setting_notification_upload">Upload Notification Codes</string>
     <string name="setting_notification_upload_summary">Auto-upload verification codes from app notifications (system-level capture, no notification access needed)</string>
+    <string name="setting_verification_code_auto_cleanup">Auto-delete Uploaded Codes</string>
+    <string name="setting_verification_code_auto_cleanup_summary">Delete the history entry 60 seconds after a code is uploaded and sync the deletion to the server</string>
     <string name="setting_language">Language</string>
     <string name="setting_language_auto">Follow system</string>
     <string name="setting_language_zh">中文</string>

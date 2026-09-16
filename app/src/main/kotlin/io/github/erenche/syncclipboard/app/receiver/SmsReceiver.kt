@@ -59,7 +59,10 @@ class SmsReceiver : BroadcastReceiver() {
             SyncClipboardBridge.with(context)
                 .to("com.android.systemui")
                 .key(BridgeKeys.UPLOAD_TEXT)
-                .payload(Bundle().apply { putString("text", code) })
+                .payload(Bundle().apply {
+                    putString("text", code)
+                    putBoolean("verificationCode", true)
+                })
                 .send()
         } catch (e: Exception) {
             Logger.error(TAG, "Failed to forward SMS code via bridge", e)

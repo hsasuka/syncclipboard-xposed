@@ -251,6 +251,7 @@ fun SyncSettingsCard(context: android.content.Context) {
     val screenOffDelaySec = config.screenOffDisconnectDelaySec
     val smsUpload = config.enableSmsUpload
     val notifUpload = config.enableNotificationUpload
+    val verificationCodeAutoCleanup = config.enableVerificationCodeAutoCleanup
 
     // 当前激活服务器类型：SyncClipboard 官方服务器显示息屏断开/省电断开设置，
     // 其他模式（WebDAV/S3）保留轮询间隔与息屏/省电停止轮询
@@ -355,6 +356,10 @@ fun SyncSettingsCard(context: android.content.Context) {
         // 不再依赖 App 的 NotificationListenerService / 系统"通知访问权限"，
         // 开关只控制引擎是否上传（enableNotificationUpload 由引擎端门控）。
         pushConfig(config.copy(enableNotificationUpload = enabled))
+    }
+
+    fun toggleVerificationCodeAutoCleanup(enabled: Boolean) {
+        pushConfig(config.copy(enableVerificationCodeAutoCleanup = enabled))
     }
 
     Card(
@@ -479,6 +484,12 @@ fun SyncSettingsCard(context: android.content.Context) {
             title = stringResource(R.string.setting_notification_upload),
             summary = stringResource(R.string.setting_notification_upload_summary),
             onCheckedChange = { toggleNotificationUpload(it) }
+        )
+        SwitchPreference(
+            checked = verificationCodeAutoCleanup,
+            title = stringResource(R.string.setting_verification_code_auto_cleanup),
+            summary = stringResource(R.string.setting_verification_code_auto_cleanup_summary),
+            onCheckedChange = { toggleVerificationCodeAutoCleanup(it) }
         )
     }
 }

@@ -71,7 +71,7 @@ object UploadQueue {
         list.add(QueuedUpload(content = content))
         val trimmed = list.takeLast(MAX_QUEUE_SIZE)
         persist(context, trimmed)
-        Logger.info(TAG, "Upload queued (size=${trimmed.size}): ${content.text.take(30)}")
+        Logger.info(TAG, "Upload queued (size=${trimmed.size}, key=${key.take(12)}, textLength=${content.text.length})")
     }
 
     /** 取出队首（不移除） */
