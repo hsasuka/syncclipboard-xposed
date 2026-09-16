@@ -1118,15 +1118,15 @@ class SyncEngine private constructor() {
             val patchFailed = patchResults.count { it == PatchOutcome.FAILED }
             Logger.info(TAG, "syncHistory: PATCH needSync=${needSyncItems.size}, success=$patchSuccess, conflict=$patchConflict, notFound=$patchNotFound, failed=$patchFailed")
 
-            // 5. 上传 LocalOnly 记录（POST）——仅无数据文件的小记录，并发化
+            // 5. 上传 LocalOnly 记录（POST），包括带数据文件的记录，并发化
             // 与 RN pushLocalOnlyRecords 一致，单条失败用 try-catch 包裹不中断整体
-            val localOnlyItems = hs.getUnsyncedRecords().filter { !it.first.hasData }
+            val localOnlyItems = hs.getUnsyncedRecords()
             val postSemaphore = Semaphore(5)
             val postResults = coroutineScope {
-                localOnlyItems.map { (item, _) ->
+                localOnlyItems.map { (item, filePath) ->
                     async(Dispatchers.IO) {
                         postSemaphore.withPermit {
-                            processPostItem(item, client, hs)
+                            processPostItem(item, filePath, client, hs)
                         }
                     }
                 }.awaitAll()
@@ -1246,12 +1246,20 @@ class SyncEngine private constructor() {
     /** 上传单条 LocalOnly 记录到服务器 */
     private suspend fun processPostItem(
         item: HistoryItem,
+        filePath: String?,
         client: SyncClipboardApi,
         hs: HistoryService
     ): PostOutcome {
         return try {
+            if (item.hasData) {
+                val dataFile = filePath?.let { java.io.File(it) }
+                if (dataFile == null || !dataFile.isFile) {
+                    Logger.warn(TAG, "syncHistory: history data file missing for ${item.profileHash}")
+                    return PostOutcome.FAILED
+                }
+            }
             val dto = hs.toDto(item)
-            val result = client.uploadHistoryRecord(dto, null)
+            val result = client.uploadHistoryRecord(dto, filePath)
             if (result != null) {
                 hs.applyServerUpdate(item.profileHash, result)
                 if (result.version != item.version) PostOutcome.CONFLICT else PostOutcome.SUCCESS
@@ -1424,10 +1432,13 @@ class SyncEngine private constructor() {
             delay(waitMs)
             while (isActive) {
                 try {
-                    performVerificationCleanup(key)
-                    removeVerificationCleanupTask(key)
-                    verificationCleanupJobs.remove(key)
-                    break
+                    if (performVerificationCleanup(key)) {
+                        removeVerificationCleanupTask(key)
+                        verificationCleanupJobs.remove(key)
+                        break
+                    }
+                    // 服务端 PATCH 失败时保留持久化任务，直到网络恢复或请求成功。
+                    delay(30_000L)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -1451,16 +1462,21 @@ class SyncEngine private constructor() {
         }
     }
 
-    private suspend fun performVerificationCleanup(profileHash: String) {
+    private suspend fun performVerificationCleanup(profileHash: String): Boolean {
         val tombstone = getHistoryService()?.deleteByProfileHash(profileHash)
         if (tombstone != null) {
             notifyContentChanged()
-            // 删除操作不受历史同步开关影响；失败会留下 NeedSync 墓碑，网络恢复后重试。
-            pushSingleHistoryUpdate(tombstone.id)
-            Logger.info(TAG, "Verification history cleaned: hash=${profileHash.take(12)}")
+            // 删除操作不受历史同步开关影响；失败会留下 NeedSync 墓碑，任务保留并重试。
+            val outcome = pushSingleHistoryUpdate(tombstone.id)
+            if (outcome == PatchOutcome.FAILED) {
+                Logger.warn(TAG, "Verification history cleanup pending: hash=${profileHash.take(12)}")
+                return false
+            }
+            Logger.info(TAG, "Verification history cleaned: hash=${profileHash.take(12)}, outcome=$outcome")
         } else {
             Logger.info(TAG, "Verification cleanup: no history item for hash=${profileHash.take(12)}")
         }
+        return true
     }
 
     private fun loadVerificationCleanupTasks(): Map<String, Long> {
